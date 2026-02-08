@@ -2,6 +2,8 @@
 Python-based automated cryptocurrency/stock trading bot using API
 업비트(Upbit) API를 활용하여 실시간 시세 조회, 차트 분석, 그리고 AI 기반 변동성 돌파 전략을 통해 자동 매매를 수행하는 풀스택 트레이딩 대시보드 프로젝트입니다.
 
+<img width="1264" height="668" alt="image" src="https://github.com/user-attachments/assets/4a4d7179-2a3b-4a32-8bdf-71db4e65b21d" />
+
 ---
 
 1. 배경 및 필요성
