@@ -10,6 +10,15 @@ import threading
 import os
 import requests
 from dotenv import load_dotenv
+import warnings
+
+# --- 0. 경고 메시지 차단 및 로그 함수 추가 ---
+warnings.filterwarnings("ignore")
+
+def log_trade(msg):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open("trading_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"[{now}] {msg}\n")
 
 # --- 1. API 키 및 초기 설정 (.env 파일 로드) ---
 load_dotenv()
@@ -146,7 +155,6 @@ def get_ai_target_prices(ticker, avg_buy_p=0):
             target_sl = target_buy - (atr * loss_multi)
         else:
             # 매수 후(보유 중): 무조건 '현재가'를 중심으로 익/손절을 실시간 트레일링 적용
-            # 이렇게 하면 현재가보다 익절가가 낮아지는 모순이 절대 수학적으로 발생하지 않음!
             target_sell = curr_p + (atr * profit_multi)
             target_sl = curr_p - (atr * loss_multi)
             
@@ -216,7 +224,7 @@ def get_backtest_report(ticker):
     except:
         return None
 
-# --- 3. 실시간 자동매매 엔진 (백그라운드 스레드) ---
+# --- 3. 실시간 자동매매 엔진 ---
 def trading_engine():
     while True:
         try:
@@ -237,18 +245,29 @@ def trading_engine():
                         if ai_buy_p and avg_buy_p == 0 and curr_p >= ai_buy_p and trend_ok:
                             krw_bal = upbit.get_balance("KRW")
                             if krw_bal >= bot['budget'] and bot['budget'] >= 5000:
-                                upbit.buy_market_order(ticker, bot['budget'])
+                                res = upbit.buy_market_order(ticker, bot['budget'])
+                                # 로그 추가
+                                log_trade(f"🛒 [AI 매수실행] 종목: {ticker} | 체결가: {curr_p:,.0f} | AI 목표가: {ai_buy_p:,.0f}")
+                                
                         elif avg_buy_p > 0:
                             coin_bal = upbit.get_balance(ticker)
-                            if coin_bal > 0 and curr_p >= ai_sell_p:
-                                upbit.sell_market_order(ticker, coin_bal)
-                            elif coin_bal > 0 and curr_p <= ai_sl_p:
-                                upbit.sell_market_order(ticker, coin_bal)
+                            if coin_bal > 0:
+                                # 익절 로그 추가
+                                if curr_p >= ai_sell_p:
+                                    upbit.sell_market_order(ticker, coin_bal)
+                                    log_trade(f"💰 [AI 익절완료] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 익절가: {ai_sell_p:,.0f} | 평단: {avg_buy_p:,.0f}")
+                                # 손절 로그 추가
+                                elif curr_p <= ai_sl_p:
+                                    upbit.sell_market_order(ticker, coin_bal)
+                                    log_trade(f"📉 [AI 손절완료] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 손절가: {ai_sl_p:,.0f} | 평단: {avg_buy_p:,.0f}")
+                    
                     elif bot['is_active'] == 1 and avg_buy_p > 0:
                         current_ror = (curr_p / avg_buy_p) - 1
                         if current_ror <= -bot['stop_loss'] or current_ror >= bot['target_profit']:
                             coin_bal = upbit.get_balance(ticker)
-                            if coin_bal > 0: upbit.sell_market_order(ticker, coin_bal)
+                            if coin_bal > 0: 
+                                upbit.sell_market_order(ticker, coin_bal)
+                                log_trade(f"📢 [수동봇 매도] 종목: {ticker} | 매도가: {curr_p:,.0f} | 평단: {avg_buy_p:,.0f}")
 
                 # [매도 봇 로직]
                 elif bot_type == 'SELL':
@@ -256,15 +275,21 @@ def trading_engine():
                         _, ai_sell_p, ai_sl_p, _, _ = get_ai_target_prices(ticker, avg_buy_p)
                         if ai_sell_p and avg_buy_p > 0:
                             coin_bal = upbit.get_balance(ticker)
-                            if coin_bal > 0 and curr_p >= ai_sell_p:
-                                upbit.sell_market_order(ticker, coin_bal)
-                            elif coin_bal > 0 and curr_p <= ai_sl_p:
-                                upbit.sell_market_order(ticker, coin_bal)
+                            if coin_bal > 0:
+                                if curr_p >= ai_sell_p:
+                                    upbit.sell_market_order(ticker, coin_bal)
+                                    log_trade(f"💰 [AI 익절완료(SELL봇)] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 익절가: {ai_sell_p:,.0f}")
+                                elif curr_p <= ai_sl_p:
+                                    upbit.sell_market_order(ticker, coin_bal)
+                                    log_trade(f"📉 [AI 손절완료(SELL봇)] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 손절가: {ai_sl_p:,.0f}")
+                    
                     elif bot['is_active'] == 1 and avg_buy_p > 0:
                         current_ror = (curr_p / avg_buy_p) - 1
                         if current_ror <= -bot['stop_loss'] or current_ror >= bot['target_profit']:
                             coin_bal = upbit.get_balance(ticker)
-                            if coin_bal > 0: upbit.sell_market_order(ticker, coin_bal)
+                            if coin_bal > 0: 
+                                upbit.sell_market_order(ticker, coin_bal)
+                                log_trade(f"📢 [수동봇 매도] 종목: {ticker} | 매도가: {curr_p:,.0f}")
             
             time.sleep(1)
         except Exception as e:
@@ -324,7 +349,6 @@ def load_config_dialog(ticker):
         
         st.divider()
         
-        # [수정] 혼란을 주던 '평단가' 제거 및 명확한 AI 목표가 렌더링
         if new_ai and ai_buy:
             trend_str = f"🟢 상승장 (매수 허용)" if trend_ok else f"🔴 하락장 (매수 보류)"
             sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
@@ -616,7 +640,6 @@ with tab_main:
 
                 is_ai_mode = st.toggle("✨ AI 자동 감시 모드 활성화", key=buy_ai_key)
                 
-                # [수정] 오해를 주던 '평단가' 글자 삭제, 깔끔한 AI 목표가 렌더링
                 if is_ai_mode and ai_target_buy:
                     trend_str = "🟢 상승장 (매수 허용)" if trend_ok else "🔴 하락장 (매수 보류)"
                     sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
@@ -670,7 +693,6 @@ with tab_main:
 
                 is_ai_mode = st.toggle("✨ AI 자동 감시 모드 활성화", key=sell_ai_key)
                 
-                # [수정] 오해를 주던 '평단가' 글자 삭제, 깔끔한 AI 목표가 렌더링
                 if is_ai_mode and ai_target_buy:
                     trend_str = "🟢 상승장 (매수 허용)" if trend_ok else "🔴 하락장 (매수 보류)"
                     sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
