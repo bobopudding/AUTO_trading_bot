@@ -1,6 +1,7 @@
 import streamlit as st
 import pyupbit
 import pandas as pd
+import numpy as np
 import sqlite3
 import time
 import streamlit.components.v1 as components
@@ -21,7 +22,6 @@ def init_db():
     conn = sqlite3.connect("upbit_trading.db")
     cur = conn.cursor()
     
-    # 테이블 생성 시 bot_type 컬럼 추가 (매수/매도 구분)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
             ticker TEXT PRIMARY KEY,
@@ -36,7 +36,6 @@ def init_db():
         )
     """)
     
-    # 기존 DB에 누락된 컬럼 추가 (마이그레이션)
     cur.execute("PRAGMA table_info(user_settings)")
     columns = [column[1] for column in cur.fetchall()]
     
@@ -59,13 +58,11 @@ def init_db():
     conn.commit()
     conn.close()
 
-# 애플리케이션 시작 시 DB 초기화 강제 실행
 init_db()
 
-# 주문 결과를 정밀하게 체크하여 실제 에러 메시지를 반환하는 함수
 def check_order_result(res):
     if res is None:
-        return False, "업비트 서버로부터 응답이 없습니다. (API 키 혹은 네트워크 확인)"
+        return False, "업비트 서버로부터 응답이 없습니다. (API 키 확인)"
     if isinstance(res, dict) and 'error' in res:
         err_msg = res.get('error', {}).get('message', '알 수 없는 오류')
         return False, f"업비트 거절 사유: {err_msg}"
@@ -73,41 +70,132 @@ def check_order_result(res):
         return True, "실제 업비트 주문 접수 성공!"
     return False, f"비정상 응답 발생: {res}"
 
-# AI 타겟 가격 계산 함수 (손절가 추가)
-def get_ai_target_prices(ticker):
+# [퀀트 알고리즘 핵심] 현재가 트레일링 스탑 & 프랙탈 기반 동적 타점
+def get_ai_target_prices(ticker, avg_buy_p=0):
     try:
-        df = pyupbit.get_ohlcv(ticker, interval="day", count=2)
-        if df is None or len(df) < 2:
-            return None, None, None
-        # AI 감시가 (변동성 돌파 타겟)
-        target_buy = df.iloc[1]['open'] + (df.iloc[0]['high'] - df.iloc[0]['low']) * 0.5
-        # AI 익절가 (감시가 대비 2% 상단)
-        target_sell = target_buy * 1.02 
-        # AI 손절가 (감시가 대비 2% 하단)
-        target_sl = target_buy * 0.98
-        return target_buy, target_sell, target_sl
-    except:
-        return None, None, None
+        # 1. 거시적 맥락 분석을 위한 과거 1년 데이터 로드
+        df_day = pyupbit.get_ohlcv(ticker, interval="day", count=365)
+        if df_day is None or len(df_day) < 30:
+            return None, None, None, False, 0
+            
+        # 1-1. 백테스트 지표 실시간 산출 (승률, MDD)
+        df_day['range_d'] = (df_day['high'] - df_day['low']) * 0.5
+        df_day['target_d'] = df_day['open'] + df_day['range_d'].shift(1)
+        df_day['ror_d'] = np.where(df_day['high'] > df_day['target_d'], df_day['close'] / df_day['target_d'], 1.0)
+        df_day['hpr_d'] = df_day['ror_d'].cumprod()
+        df_day['dd_d'] = (df_day['hpr_d'].cummax() - df_day['hpr_d']) / df_day['hpr_d'].cummax()
+        
+        mdd_risk = df_day['dd_d'].max()
+        trade_count = len(df_day[df_day['ror_d'] != 1.0])
+        win_rate = (df_day['ror_d'] > 1.0).sum() / trade_count if trade_count > 0 else 0.5
+        
+        # 1-2. 프랙탈 패턴 매칭 (현재 5일과 가장 비슷한 과거 패턴 탐색)
+        recent_5 = df_day['close'].iloc[-5:].values
+        norm_recent = (recent_5 - recent_5.min()) / (recent_5.max() - recent_5.min() + 1e-9)
+        
+        best_sim = -1
+        expected_future_return = 0
+        
+        for i in range(len(df_day) - 10):
+            past_5 = df_day['close'].iloc[i:i+5].values
+            norm_past = (past_5 - past_5.min()) / (past_5.max() - past_5.min() + 1e-9)
+            dist = np.sum((norm_recent - norm_past)**2)
+            sim = 1 / (1 + dist)
+            
+            if sim > best_sim:
+                best_sim = sim
+                expected_future_return = (df_day['close'].iloc[i+8] - df_day['close'].iloc[i+4]) / df_day['close'].iloc[i+4]
 
-# --- 2. 1년 백테스트 분석 로직 (캐싱 적용 및 AI 손절 로직 반영) ---
+        # 2. 미세 타점(단기 모멘텀)을 위한 60분봉 분석
+        df_min = pyupbit.get_ohlcv(ticker, interval="minute60", count=100)
+        if df_min is None or len(df_min) < 20:
+            return None, None, None, False, 0
+            
+        # 2-1. ATR (순수 변동성) 및 시장 노이즈 비율 계산
+        high_low = df_min['high'] - df_min['low']
+        high_close = (df_min['high'] - df_min['close'].shift()).abs()
+        low_close = (df_min['low'] - df_min['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        
+        direction = (df_min['close'] - df_min['open']).abs()
+        volatility = (df_min['high'] - df_min['low']).replace(0, 0.0001)
+        noise = 1.0 - (direction / volatility)
+        k_val = noise.rolling(20).mean().iloc[-1]
+        k_val = max(0.2, min(k_val, 0.8))
+        
+        curr_p = pyupbit.get_current_price(ticker)
+        prev_candle = df_min.iloc[-2]
+        curr_candle = df_min.iloc[-1]
+        
+        # 3. AI 목표 매수가 계산
+        pattern_weight = 1.0 - max(-0.5, min(expected_future_return, 0.5))
+        target_buy = curr_candle['open'] + (prev_candle['high'] - prev_candle['low']) * k_val * pattern_weight
+        
+        # 4. 백테스트 데이터를 반영한 [리스크 조정 ATR 계수]
+        profit_multi = 1.5 + (win_rate - 0.5) + (expected_future_return * 2)
+        profit_multi = max(1.0, min(profit_multi, 3.0)) 
+        
+        loss_multi = 1.0 - (mdd_risk * 0.5) 
+        loss_multi = max(0.5, min(loss_multi, 1.5)) 
+        
+        # 5. [핵심 모순 해결] 현재가 기반 동적 트레일링 타겟 연산
+        if avg_buy_p == 0:
+            # 매수 전: 계획된 매수 타점을 중심으로 가상의 익/손절 라인 형성
+            target_sell = target_buy + (atr * profit_multi)
+            target_sl = target_buy - (atr * loss_multi)
+        else:
+            # 매수 후(보유 중): 무조건 '현재가'를 중심으로 익/손절을 실시간 트레일링 적용
+            # 이렇게 하면 현재가보다 익절가가 낮아지는 모순이 절대 수학적으로 발생하지 않음!
+            target_sell = curr_p + (atr * profit_multi)
+            target_sl = curr_p - (atr * loss_multi)
+            
+            # 단, 급등락에 의해 손절가가 현재가를 찌르는 오류 방지용 안전장치
+            if target_sl >= curr_p:
+                target_sl = curr_p * 0.995
+        
+        ma15 = df_min['close'].rolling(15).mean().iloc[-1]
+        trend_ok = (curr_p >= ma15) and (expected_future_return > -0.03)
+        
+        return target_buy, target_sell, target_sl, trend_ok, expected_future_return
+    except:
+        return None, None, None, False, 0
+
+# [기존 1년 백테스트 분석 - UI 요약 표시용 (단기 60분봉 기반)]
 @st.cache_data(ttl=3600)
 def get_backtest_report(ticker):
     try:
-        df = pyupbit.get_ohlcv(ticker, interval="day", count=365)
-        if df is None or len(df) < 365:
+        df = pyupbit.get_ohlcv(ticker, interval="minute60", count=720)
+        if df is None or len(df) < 100:
             return None
             
-        df['range'] = (df['high'] - df['low']) * 0.5
-        df['target'] = df['open'] + df['range'].shift(1)
+        df['ma15'] = df['close'].rolling(15).mean()
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        df['tr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr'] = df['tr'].rolling(14).mean()
         
-        # 수익률 및 손절가 계산 로직
+        direction = (df['close'] - df['open']).abs()
+        volatility = (df['high'] - df['low']).replace(0, 0.0001)
+        df['noise'] = 1.0 - (direction / volatility)
+        df['k_val'] = df['noise'].rolling(20).mean().clip(0.2, 0.8)
+        
+        df['range'] = df['high'] - df['low']
+        df['target'] = df['open'] + df['range'].shift(1) * df['k_val'].shift(1)
+        
         def calc_ror(row):
-            if row['high'] > row['target']:
-                target_sl = row['target'] * 0.98  # 백테스트에도 2% 손절 적용
-                if row['low'] < target_sl:
-                    return 0.98
+            if pd.isna(row['target']) or pd.isna(row['atr']) or pd.isna(row['ma15']):
+                return 1.0
+            if row['high'] > row['target'] and row['open'] > row['ma15']:
+                tp = row['target'] + (row['atr'] * 1.5)
+                sl = row['target'] - (row['atr'] * 1.0)
+                if row['low'] <= sl:
+                    return (sl / row['target']) - 0.001
+                elif row['high'] >= tp:
+                    return (tp / row['target']) - 0.001
                 else:
-                    return row['close'] / row['target']
+                    return (row['close'] / row['target']) - 0.001
             return 1.0
 
         df['ror'] = df.apply(calc_ror, axis=1)
@@ -145,8 +233,8 @@ def trading_engine():
                 # [매수 봇 로직]
                 if bot_type == 'BUY':
                     if bot['ai_mode'] == 1:
-                        ai_buy_p, ai_sell_p, ai_sl_p = get_ai_target_prices(ticker)
-                        if avg_buy_p == 0 and curr_p >= ai_buy_p:
+                        ai_buy_p, ai_sell_p, ai_sl_p, trend_ok, _ = get_ai_target_prices(ticker, avg_buy_p)
+                        if ai_buy_p and avg_buy_p == 0 and curr_p >= ai_buy_p and trend_ok:
                             krw_bal = upbit.get_balance("KRW")
                             if krw_bal >= bot['budget'] and bot['budget'] >= 5000:
                                 upbit.buy_market_order(ticker, bot['budget'])
@@ -165,8 +253,8 @@ def trading_engine():
                 # [매도 봇 로직]
                 elif bot_type == 'SELL':
                     if bot['ai_mode'] == 1:
-                        _, ai_sell_p, ai_sl_p = get_ai_target_prices(ticker)
-                        if avg_buy_p > 0:
+                        _, ai_sell_p, ai_sl_p, _, _ = get_ai_target_prices(ticker, avg_buy_p)
+                        if ai_sell_p and avg_buy_p > 0:
                             coin_bal = upbit.get_balance(ticker)
                             if coin_bal > 0 and curr_p >= ai_sell_p:
                                 upbit.sell_market_order(ticker, coin_bal)
@@ -193,7 +281,8 @@ def load_config_dialog(ticker):
     st.write(f"### {ticker} 종목의 저장된 세팅")
     
     curr_p = pyupbit.get_current_price(ticker)
-    ai_buy, ai_sell, ai_sl = get_ai_target_prices(ticker)
+    avg_buy_p = upbit.get_avg_buy_price(ticker)
+    ai_buy, ai_sell, ai_sl, trend_ok, exp_ret = get_ai_target_prices(ticker, avg_buy_p)
     
     conn = sqlite3.connect("upbit_trading.db")
     cfg = pd.read_sql("SELECT * FROM user_settings WHERE ticker = ?", conn, params=(ticker,))
@@ -202,18 +291,15 @@ def load_config_dialog(ticker):
     if not cfg.empty:
         row = cfg.iloc[0]
         bot_type = row.get('bot_type', 'BUY')
-        st.info(f"이전에 저장한 [{ '매수 봇' if bot_type == 'BUY' else '매도 봇' }] 설정을 불러왔습니다.")
+        st.info(f"이전에 저장한 [{ '매수' if bot_type == 'BUY' else '매도' }] 설정을 불러왔습니다.")
         
-        # 다이얼로그에서도 AI 모드를 먼저 렌더링하여 비활성화 조건으로 활용
         db_ai = True if row['ai_mode'] == 1 else False
         new_ai = st.toggle("✨ AI 자동 감시 모드 활성화", value=db_ai, key="diag_ai_toggle_early")
         
-        # [수정 반영] 팝업창에서도 메인 화면처럼 가격과 수량을 입력받도록 복구
         coin_symbol = ticker.split("-")[1]
         
         if bot_type == 'BUY':
             b_price = st.number_input("매수 가격(KRW)", value=int(curr_p), disabled=new_ai, key="diag_bp")
-            # 기존 DB의 예산을 현재가로 나누어 대략적인 수량 복원
             default_qty = float(row['budget'] / curr_p) if curr_p > 0 else 0.1
             b_qty = st.number_input(f"주문 수량({coin_symbol})", min_value=0.0001, value=default_qty, format="%.4f", disabled=new_ai, key="diag_bq")
             
@@ -238,12 +324,15 @@ def load_config_dialog(ticker):
         
         st.divider()
         
-        # 매수/매도 설정에 따라 AI 타겟가 동적 표시
-        if new_ai:
+        # [수정] 혼란을 주던 '평단가' 제거 및 명확한 AI 목표가 렌더링
+        if new_ai and ai_buy:
+            trend_str = f"🟢 상승장 (매수 허용)" if trend_ok else f"🔴 하락장 (매수 보류)"
+            sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
+            
             if bot_type == 'BUY':
-                st.info(f"📍 **AI 매수가:** {ai_buy:,.0f} / **AI 익절가:** {ai_sell:,.0f} / **AI 손절가:** {ai_sl:,.0f}")
+                st.info(f"📍 **AI 매수가:** {ai_buy:,.0f} / **AI 익절가:** {ai_sell:,.0f} / **AI 손절가:** {ai_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
             else:
-                st.info(f"📍 **AI 익절가:** {ai_sell:,.0f} / **AI 손절가:** {ai_sl:,.0f}")
+                st.info(f"📍 **AI 익절가:** {ai_sell:,.0f} / **AI 손절가:** {ai_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
             st.caption("※ AI 모드 작동 중에는 엔진 가동 상태 및 수동 익절/손절/입력창이 비활성화됩니다.")
         
         is_disabled = new_ai
@@ -270,7 +359,7 @@ def load_config_dialog(ticker):
         st.error("해당 종목의 저장된 설정이 없습니다.")
 
 # --- 5. UI 설정 및 스타일 ---
-st.set_page_config(page_title="Professional Trading System", layout="wide")
+st.set_page_config(page_title="Quant Trading Bot v4", layout="wide")
 
 st.markdown("""
     <style>
@@ -290,7 +379,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 6. 사이드바 (자산 현황 수익률, 가동 리스트, 실시간 랭킹) ---
+# --- 6. 사이드바 ---
 all_tickers = pyupbit.get_tickers(fiat="KRW")
 
 if 'main_ticker' not in st.session_state:
@@ -341,17 +430,17 @@ except:
     st.sidebar.warning("자산 정보 로드 실패")
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 1년 백테스트 요약")
+st.sidebar.subheader("📊 백테스트 분석 (ATR 동적 모델)")
 bt_res = get_backtest_report(current_view_ticker)
 
 if bt_res:
     c1, c2 = st.sidebar.columns(2)
-    c1.metric("연간 수익률", f"{bt_res['수익률']:.1f}%")
+    c1.metric("예상 수익률", f"{bt_res['수익률']:.1f}%")
     c2.metric("승률", f"{bt_res['승률']:.1f}%")
     st.sidebar.caption(f"최대 낙폭(MDD): {bt_res['MDD']:.1f}% / 거래: {bt_res['거래횟수']}회")
     
-    if bt_res['수익률'] > 15: st.sidebar.success("✅ 자동매매에 적합한 추세")
-    elif bt_res['수익률'] < 0: st.sidebar.warning("⚠️ 하락장 (전략 주의)")
+    if bt_res['수익률'] > 5: st.sidebar.success("✅ 단기 모멘텀 적합")
+    elif bt_res['수익률'] < 0: st.sidebar.warning("⚠️ 변동성 리스크 주의")
 else:
     st.sidebar.info("데이터 분석 중...")
 
@@ -460,7 +549,7 @@ with tab_main:
 
     with col_right:
         if bt_res:
-            st.info(f"📊 **{coin_symbol}** 1년 분석: 수익 **{bt_res['수익률']:.1f}%**, 승률 **{bt_res['승률']:.1f}%**")
+            st.info(f"📊 **{coin_symbol}** 퀀트 분석: 수익 **{bt_res['수익률']:.1f}%**, 승률 **{bt_res['승률']:.1f}%**")
 
         st.write("### 📊 호가")
         try:
@@ -480,7 +569,8 @@ with tab_main:
         st.write(f"**현재가: {curr_price:,.0f} KRW**")
         st.markdown('<div class="min-order-alert">⚠️ 업비트 최소 주문 금액은 5,000 KRW입니다.</div>', unsafe_allow_html=True)
         
-        ai_target_buy, ai_target_sell, ai_target_sl = get_ai_target_prices(current_view_ticker)
+        current_avg_buy_p = upbit.get_avg_buy_price(current_view_ticker)
+        ai_target_buy, ai_target_sell, ai_target_sl, trend_ok, exp_ret = get_ai_target_prices(current_view_ticker, current_avg_buy_p)
         
         buy_ai_key = f"buy_ai_{current_view_ticker}"
         sell_ai_key = f"sell_ai_{current_view_ticker}"
@@ -526,8 +616,11 @@ with tab_main:
 
                 is_ai_mode = st.toggle("✨ AI 자동 감시 모드 활성화", key=buy_ai_key)
                 
+                # [수정] 오해를 주던 '평단가' 글자 삭제, 깔끔한 AI 목표가 렌더링
                 if is_ai_mode and ai_target_buy:
-                    st.info(f"📍 **AI 매수가:** {ai_target_buy:,.0f} / **AI 익절가:** {ai_target_sell:,.0f} / **AI 손절가:** {ai_target_sl:,.0f}")
+                    trend_str = "🟢 상승장 (매수 허용)" if trend_ok else "🔴 하락장 (매수 보류)"
+                    sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
+                    st.info(f"📍 **AI 매수가:** {ai_target_buy:,.0f} / **AI 익절가:** {ai_target_sell:,.0f} / **AI 손절가:** {ai_target_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
                     st.caption("※ AI 모드 활성화 시 수동 입력창 및 익절/손절 설정이 잠깁니다.")
 
                 is_active_bot = st.checkbox("이 종목 엔진 가동", value=db_active, key=f"buy_ab_{current_view_ticker}", disabled=is_ai_mode)
@@ -577,8 +670,11 @@ with tab_main:
 
                 is_ai_mode = st.toggle("✨ AI 자동 감시 모드 활성화", key=sell_ai_key)
                 
+                # [수정] 오해를 주던 '평단가' 글자 삭제, 깔끔한 AI 목표가 렌더링
                 if is_ai_mode and ai_target_buy:
-                    st.info(f"📍 **AI 익절가:** {ai_target_sell:,.0f} / **AI 손절가:** {ai_target_sl:,.0f}")
+                    trend_str = "🟢 상승장 (매수 허용)" if trend_ok else "🔴 하락장 (매수 보류)"
+                    sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
+                    st.info(f"📍 **AI 익절가:** {ai_target_sell:,.0f} / **AI 손절가:** {ai_target_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
                     st.caption("※ 매도 봇은 보유 물량에 대해 익절/손절만 수행하며 수동 입력이 잠깁니다.")
 
                 is_active_bot = st.checkbox("이 종목 엔진 가동", value=db_active, key=f"sell_ab_{current_view_ticker}", disabled=is_ai_mode)
