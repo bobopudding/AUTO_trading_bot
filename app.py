@@ -48,12 +48,17 @@ def init_db():
     cur.execute("PRAGMA table_info(user_settings)")
     columns = [column[1] for column in cur.fetchall()]
     
+    # [수정] 24시간 타임아웃을 위한 fixed_time 컬럼 추가
     required_columns = {
         "max_daily_buy": "INTEGER DEFAULT 100000",
         "max_daily_sell": "INTEGER DEFAULT 100000",
         "target_profit": "REAL DEFAULT 0.05",
         "ai_mode": "INTEGER DEFAULT 0",
-        "bot_type": "TEXT DEFAULT 'BUY'"
+        "bot_type": "TEXT DEFAULT 'BUY'",
+        "fixed_buy_p": "REAL DEFAULT 0",
+        "fixed_sell_p": "REAL DEFAULT 0",
+        "fixed_sl_p": "REAL DEFAULT 0",
+        "fixed_time": "TEXT DEFAULT ''" 
     }
     
     for col_name, col_def in required_columns.items():
@@ -150,15 +155,11 @@ def get_ai_target_prices(ticker, avg_buy_p=0):
         
         # 5. [핵심 모순 해결] 현재가 기반 동적 트레일링 타겟 연산
         if avg_buy_p == 0:
-            # 매수 전: 계획된 매수 타점을 중심으로 가상의 익/손절 라인 형성
             target_sell = target_buy + (atr * profit_multi)
             target_sl = target_buy - (atr * loss_multi)
         else:
-            # 매수 후(보유 중): 무조건 '현재가'를 중심으로 익/손절을 실시간 트레일링 적용
             target_sell = curr_p + (atr * profit_multi)
             target_sl = curr_p - (atr * loss_multi)
-            
-            # 단, 급등락에 의해 손절가가 현재가를 찌르는 오류 방지용 안전장치
             if target_sl >= curr_p:
                 target_sl = curr_p * 0.995
         
@@ -241,26 +242,68 @@ def trading_engine():
                 # [매수 봇 로직]
                 if bot_type == 'BUY':
                     if bot['ai_mode'] == 1:
-                        ai_buy_p, ai_sell_p, ai_sl_p, trend_ok, _ = get_ai_target_prices(ticker, avg_buy_p)
-                        if ai_buy_p and avg_buy_p == 0 and curr_p >= ai_buy_p and trend_ok:
-                            krw_bal = upbit.get_balance("KRW")
-                            if krw_bal >= bot['budget'] and bot['budget'] >= 5000:
-                                res = upbit.buy_market_order(ticker, bot['budget'])
-                                # 로그 추가
-                                log_trade(f"🛒 [AI 매수실행] 종목: {ticker} | 체결가: {curr_p:,.0f} | AI 목표가: {ai_buy_p:,.0f}")
-                                
+                        f_buy = bot.get('fixed_buy_p', 0)
+                        f_sell = bot.get('fixed_sell_p', 0)
+                        f_sl = bot.get('fixed_sl_p', 0)
+                        f_time_str = bot.get('fixed_time', '')
+                        trade_fund = bot['max_daily_buy']
+                        
+                        # [기능 1] 24시간 타임아웃 (안전제일 A방식)
+                        if f_buy > 0 and avg_buy_p == 0 and f_time_str:
+                            try:
+                                f_time = datetime.strptime(f_time_str, '%Y-%m-%d %H:%M:%S')
+                                if (datetime.now() - f_time).total_seconds() > 86400: # 24시간 초과
+                                    conn = sqlite3.connect("upbit_trading.db")
+                                    conn.cursor().execute("UPDATE user_settings SET ai_mode = 0 WHERE ticker = ?", (ticker,))
+                                    conn.commit(); conn.close()
+                                    log_trade(f"⏰ [타임아웃] {ticker} 24시간 경과로 상한 타점 폐기 (감시 자동종료)")
+                                    continue
+                            except: pass
+
+                        # [기능 2] 버퍼 매수 (0.2% 허용)
+                        if f_buy > 0 and avg_buy_p == 0:
+                            safe_buy_p = f_buy * 1.002 # 0.2% 여유 마진 (기차 놓침 방지)
+                            # 현재가가 박제가를 돌파했고, 허용 오차 이내일 때 지정가 매수
+                            if f_buy <= curr_p <= safe_buy_p:
+                                krw_bal = upbit.get_balance("KRW")
+                                if krw_bal >= trade_fund and trade_fund >= 5000:
+                                    buy_qty = trade_fund / curr_p
+                                    res = upbit.buy_limit_order(ticker, curr_p, buy_qty)
+                                    if res and 'uuid' in res:
+                                        log_trade(f"🎯 [기차탑승 지정가매수] 종목: {ticker} | 박제가: {f_buy:,.0f} | 체결가: {curr_p:,.0f} | 투입: {trade_fund:,.0f}")
+                        
+                        # 보유 중일 때 익절/손절/본절 감시
                         elif avg_buy_p > 0:
                             coin_bal = upbit.get_balance(ticker)
                             if coin_bal > 0:
-                                # 익절 로그 추가
-                                if curr_p >= ai_sell_p:
-                                    upbit.sell_market_order(ticker, coin_bal)
-                                    log_trade(f"💰 [AI 익절완료] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 익절가: {ai_sell_p:,.0f} | 평단: {avg_buy_p:,.0f}")
-                                # 손절 로그 추가
-                                elif curr_p <= ai_sl_p:
-                                    upbit.sell_market_order(ticker, coin_bal)
-                                    log_trade(f"📉 [AI 손절완료] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 손절가: {ai_sl_p:,.0f} | 평단: {avg_buy_p:,.0f}")
+                                # [기능 3] 무적 포지션 (본절 보존선)
+                                if f_sell > avg_buy_p:
+                                    half_profit_price = avg_buy_p + ((f_sell - avg_buy_p) * 0.5) # 절반 수익 도달 지점
+                                    break_even_price = avg_buy_p * 1.003 # 원금 + 수수료(약 0.3%) 보존선
+                                    
+                                    if curr_p >= half_profit_price and f_sl < break_even_price:
+                                        conn = sqlite3.connect("upbit_trading.db")
+                                        conn.cursor().execute("UPDATE user_settings SET fixed_sl_p = ? WHERE ticker = ?", (break_even_price, ticker))
+                                        conn.commit(); conn.close()
+                                        f_sl = break_even_price # 메모리 즉시 갱신
+                                        log_trade(f"🛡️ [무적 포지션 가동] {ticker} 절반 수익 달성! 손절가를 원금({break_even_price:,.0f}원)으로 올립니다.")
+
+                                # [기능 4] 선행 얌체 익절 (0.2% 먼저 팔기)
+                                safe_sell_p = f_sell * 0.998
+                                if f_sell > 0 and curr_p >= safe_sell_p:
+                                    upbit.sell_limit_order(ticker, curr_p, coin_bal)
+                                    log_trade(f"💰 [선행 얌체익절 완료] 종목: {ticker} | 원래목표: {f_sell:,.0f} | 체결가: {curr_p:,.0f}")
+                                
+                                # [기능 5] 한도액 시장가 탈출 (손절 혹은 본절 방어)
+                                elif f_sl > 0 and curr_p <= f_sl:
+                                    sell_qty = min(coin_bal, trade_fund / curr_p)
+                                    upbit.sell_market_order(ticker, sell_qty)
+                                    if f_sl >= avg_buy_p:
+                                        log_trade(f"🛡️ [본절 마감 방어성공] 종목: {ticker} | 원금을 안전하게 지키고 탈출했습니다. 매도가: {curr_p:,.0f}")
+                                    else:
+                                        log_trade(f"📉 [시장가 손절완료] 종목: {ticker} | 기준가: {f_sl:,.0f} | 실제매도가: {curr_p:,.0f}")
                     
+                    # 수동 모드 유지
                     elif bot['is_active'] == 1 and avg_buy_p > 0:
                         current_ror = (curr_p / avg_buy_p) - 1
                         if current_ror <= -bot['stop_loss'] or current_ror >= bot['target_profit']:
@@ -272,16 +315,20 @@ def trading_engine():
                 # [매도 봇 로직]
                 elif bot_type == 'SELL':
                     if bot['ai_mode'] == 1:
-                        _, ai_sell_p, ai_sl_p, _, _ = get_ai_target_prices(ticker, avg_buy_p)
-                        if ai_sell_p and avg_buy_p > 0:
+                        f_sell = bot.get('fixed_sell_p', 0)
+                        f_sl = bot.get('fixed_sl_p', 0)
+                        trade_fund = bot['max_daily_buy']
+                        if f_sell > 0 and avg_buy_p > 0:
                             coin_bal = upbit.get_balance(ticker)
                             if coin_bal > 0:
-                                if curr_p >= ai_sell_p:
-                                    upbit.sell_market_order(ticker, coin_bal)
-                                    log_trade(f"💰 [AI 익절완료(SELL봇)] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 익절가: {ai_sell_p:,.0f}")
-                                elif curr_p <= ai_sl_p:
-                                    upbit.sell_market_order(ticker, coin_bal)
-                                    log_trade(f"📉 [AI 손절완료(SELL봇)] 종목: {ticker} | 매도가: {curr_p:,.0f} | AI 손절가: {ai_sl_p:,.0f}")
+                                safe_sell_p = f_sell * 0.998
+                                if curr_p >= safe_sell_p:
+                                    upbit.sell_limit_order(ticker, curr_p, coin_bal)
+                                    log_trade(f"💰 [선행 얌체익절(SELL봇)] 종목: {ticker} | 체결가: {curr_p:,.0f}")
+                                elif curr_p <= f_sl:
+                                    sell_qty = min(coin_bal, trade_fund / curr_p)
+                                    upbit.sell_market_order(ticker, sell_qty)
+                                    log_trade(f"📉 [시장가 손절(SELL봇)] 종목: {ticker} | 실제매도가: {curr_p:,.0f}")
                     
                     elif bot['is_active'] == 1 and avg_buy_p > 0:
                         current_ror = (curr_p / avg_buy_p) - 1
@@ -354,10 +401,10 @@ def load_config_dialog(ticker):
             sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
             
             if bot_type == 'BUY':
-                st.info(f"📍 **AI 매수가:** {ai_buy:,.0f} / **AI 익절가:** {ai_sell:,.0f} / **AI 손절가:** {ai_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
+                st.info(f"📍 **박제 예정 매수가:** {ai_buy:,.0f} / **익절가:** {ai_sell:,.0f} / **손절가:** {ai_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
             else:
-                st.info(f"📍 **AI 익절가:** {ai_sell:,.0f} / **AI 손절가:** {ai_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
-            st.caption("※ AI 모드 작동 중에는 엔진 가동 상태 및 수동 익절/손절/입력창이 비활성화됩니다.")
+                st.info(f"📍 **박제 예정 익절가:** {ai_sell:,.0f} / **손절가:** {ai_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
+            st.caption("※ 엔진 재가동 시 위 가격이 박제되어 고정값으로 매매가 진행됩니다.")
         
         is_disabled = new_ai
         new_active = st.checkbox("이 종목 엔진 가동", value=True if row['is_active'] == 1 else False, disabled=is_disabled, key="diag_active_chk")
@@ -369,14 +416,22 @@ def load_config_dialog(ticker):
                 st.error("❌ 매수 금액(예상 결제 금액)은 최소 5,000원 이상이어야 합니다.")
             else:
                 conn = sqlite3.connect("upbit_trading.db")
-                conn.cursor().execute("""
-                    UPDATE user_settings 
-                    SET budget=?, stop_loss=?, max_daily_buy=?, max_daily_sell=?, target_profit=?, ai_mode=?, is_active=?
-                    WHERE ticker=?
-                """, (final_budget, new_sl/100, new_max_buy, new_max_sell, new_tp/100, 1 if new_ai else 0, 1 if new_active else 0, ticker))
+                if new_ai:
+                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    conn.cursor().execute("""
+                        UPDATE user_settings 
+                        SET budget=?, stop_loss=?, max_daily_buy=?, max_daily_sell=?, target_profit=?, ai_mode=1, is_active=0, fixed_buy_p=?, fixed_sell_p=?, fixed_sl_p=?, fixed_time=?
+                        WHERE ticker=?
+                    """, (final_budget, new_sl/100, new_max_buy, new_max_sell, new_tp/100, ai_buy, ai_sell, ai_sl, now_str, ticker))
+                else:
+                    conn.cursor().execute("""
+                        UPDATE user_settings 
+                        SET budget=?, stop_loss=?, max_daily_buy=?, max_daily_sell=?, target_profit=?, ai_mode=0, is_active=?
+                        WHERE ticker=?
+                    """, (final_budget, new_sl/100, new_max_buy, new_max_sell, new_tp/100, 1 if new_active else 0, ticker))
                 conn.commit()
                 conn.close()
-                st.toast(f"{ticker} 설정 업데이트 완료!")
+                st.toast(f"{ticker} 설정 업데이트 및 가격 박제 완료!")
                 time.sleep(0.5)
                 st.rerun()
     else:
@@ -643,8 +698,8 @@ with tab_main:
                 if is_ai_mode and ai_target_buy:
                     trend_str = "🟢 상승장 (매수 허용)" if trend_ok else "🔴 하락장 (매수 보류)"
                     sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
-                    st.info(f"📍 **AI 매수가:** {ai_target_buy:,.0f} / **AI 익절가:** {ai_target_sell:,.0f} / **AI 손절가:** {ai_target_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
-                    st.caption("※ AI 모드 활성화 시 수동 입력창 및 익절/손절 설정이 잠깁니다.")
+                    st.info(f"📍 **박제 예정 매수가:** {ai_target_buy:,.0f} / **익절가:** {ai_target_sell:,.0f} / **손절가:** {ai_target_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
+                    st.caption("※ 봇 가동 시 위 가격이 박제되어 변동되지 않습니다.")
 
                 is_active_bot = st.checkbox("이 종목 엔진 가동", value=db_active, key=f"buy_ab_{current_view_ticker}", disabled=is_ai_mode)
                 slider_final_disabled = is_ai_mode or (not is_active_bot)
@@ -657,12 +712,22 @@ with tab_main:
                     else:
                         conn = sqlite3.connect("upbit_trading.db")
                         final_budget = order_total_cost if not is_ai_mode else (int(db_buy_cfg.iloc[0]['budget']) if not db_buy_cfg.empty else 10000)
-                        conn.cursor().execute("""
-                            INSERT OR REPLACE INTO user_settings 
-                            (ticker, is_active, budget, stop_loss, max_daily_buy, max_daily_sell, target_profit, ai_mode, bot_type) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (current_view_ticker, 1 if is_active_bot else 0, final_budget, st_loss/100, max_b_limit, 100000, target_profit/100, 1 if is_ai_mode else 0, 'BUY'))
-                        conn.commit(); conn.close(); st.toast("매수 봇 저장 완료!"); time.sleep(0.5); st.rerun()
+                        
+                        if is_ai_mode:
+                            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            conn.cursor().execute("""
+                                INSERT OR REPLACE INTO user_settings 
+                                (ticker, is_active, budget, stop_loss, max_daily_buy, max_daily_sell, target_profit, ai_mode, bot_type, fixed_buy_p, fixed_sell_p, fixed_sl_p, fixed_time) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (current_view_ticker, 0, final_budget, st_loss/100, max_b_limit, 100000, target_profit/100, 1, 'BUY', ai_target_buy, ai_target_sell, ai_target_sl, now_str))
+                        else:
+                            conn.cursor().execute("""
+                                INSERT OR REPLACE INTO user_settings 
+                                (ticker, is_active, budget, stop_loss, max_daily_buy, max_daily_sell, target_profit, ai_mode, bot_type) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (current_view_ticker, 1 if is_active_bot else 0, final_budget, st_loss/100, max_b_limit, 100000, target_profit/100, 0, 'BUY'))
+                        
+                        conn.commit(); conn.close(); st.toast("매수 봇 설정 및 가격 박제 완료!"); time.sleep(0.5); st.rerun()
 
         # --- 매도 탭 ---
         with o_tab2:
@@ -696,8 +761,8 @@ with tab_main:
                 if is_ai_mode and ai_target_buy:
                     trend_str = "🟢 상승장 (매수 허용)" if trend_ok else "🔴 하락장 (매수 보류)"
                     sim_str = "상승 기대" if exp_ret > 0 else "하락 우려"
-                    st.info(f"📍 **AI 익절가:** {ai_target_sell:,.0f} / **AI 손절가:** {ai_target_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
-                    st.caption("※ 매도 봇은 보유 물량에 대해 익절/손절만 수행하며 수동 입력이 잠깁니다.")
+                    st.info(f"📍 **박제 예정 익절가:** {ai_target_sell:,.0f} / **손절가:** {ai_target_sl:,.0f}\n\n📊 모멘텀 필터: {trend_str}\n🧠 프랙탈 예측: {sim_str} ({exp_ret*100:+.2f}%)")
+                    st.caption("※ 매도 봇은 보유 물량에 대해 박제된 익절/손절만 수행합니다.")
 
                 is_active_bot = st.checkbox("이 종목 엔진 가동", value=db_active, key=f"sell_ab_{current_view_ticker}", disabled=is_ai_mode)
                 slider_final_disabled = is_ai_mode or (not is_active_bot)
@@ -706,12 +771,20 @@ with tab_main:
 
                 if st.button("매도 봇 설정 저장 및 가동", key=f"sell_save_{current_view_ticker}"):
                     conn = sqlite3.connect("upbit_trading.db")
-                    conn.cursor().execute("""
-                        INSERT OR REPLACE INTO user_settings 
-                        (ticker, is_active, budget, stop_loss, max_daily_buy, max_daily_sell, target_profit, ai_mode, bot_type) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (current_view_ticker, 1 if is_active_bot else 0, 5000, st_loss/100, 100000, max_s_limit, target_profit/100, 1 if is_ai_mode else 0, 'SELL'))
-                    conn.commit(); conn.close(); st.toast("매도 봇 저장 완료!"); time.sleep(0.5); st.rerun()
+                    if is_ai_mode:
+                        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        conn.cursor().execute("""
+                            INSERT OR REPLACE INTO user_settings 
+                            (ticker, is_active, budget, stop_loss, max_daily_buy, max_daily_sell, target_profit, ai_mode, bot_type, fixed_buy_p, fixed_sell_p, fixed_sl_p, fixed_time) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (current_view_ticker, 0, 5000, st_loss/100, 100000, max_s_limit, target_profit/100, 1, 'SELL', ai_target_buy, ai_target_sell, ai_target_sl, now_str))
+                    else:
+                        conn.cursor().execute("""
+                            INSERT OR REPLACE INTO user_settings 
+                            (ticker, is_active, budget, stop_loss, max_daily_buy, max_daily_sell, target_profit, ai_mode, bot_type) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (current_view_ticker, 1 if is_active_bot else 0, 5000, st_loss/100, 100000, max_s_limit, target_profit/100, 0, 'SELL'))
+                    conn.commit(); conn.close(); st.toast("매도 봇 설정 및 가격 박제 완료!"); time.sleep(0.5); st.rerun()
 
 with tab_history:
     st.write(f"### 📜 {current_view_ticker} 거래 내역")
